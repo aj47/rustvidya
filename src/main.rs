@@ -1,4 +1,5 @@
 mod video;
+mod webcam;
 
 use anyhow::Result;
 use crossterm::{
@@ -18,6 +19,13 @@ use ratatui::{
 use std::path::PathBuf;
 use std::{io, time::Duration};
 use video::VideoPlayer;
+use webcam::WebcamPlayer;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Mode {
+    Video,
+    Webcam,
+}
 
 #[derive(Debug, Clone)]
 struct FileEntry {
@@ -31,6 +39,8 @@ struct App {
     selected: usize,
     current_dir: PathBuf,
     video_player: VideoPlayer,
+    webcam_player: WebcamPlayer,
+    mode: Mode,
     status_message: String,
     scroll_offset: usize,
 }
@@ -43,7 +53,9 @@ impl App {
             selected: 0,
             current_dir: current_dir.clone(),
             video_player: VideoPlayer::new(80, 20)?,
-            status_message: String::from("Welcome to RustVidya 🎬 - Select a video file"),
+            webcam_player: WebcamPlayer::new(80, 20)?,
+            mode: Mode::Video,
+            status_message: String::from("Welcome to RustVidya 🎬 - [w] Webcam | Select a video file"),
             scroll_offset: 0,
         };
         app.load_directory(&current_dir);
@@ -136,7 +148,10 @@ impl App {
     }
 
     fn update(&mut self) {
-        self.video_player.update();
+        match self.mode {
+            Mode::Video => self.video_player.update(),
+            Mode::Webcam => self.webcam_player.update(),
+        }
     }
 }
 
@@ -175,13 +190,59 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                 if key.kind == KeyEventKind::Press {
                     match key.code {
                         KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Char(' ') => app.video_player.toggle_playback(),
-                        KeyCode::Enter => app.select(),
+                        KeyCode::Char('w') => {
+                            // Toggle webcam mode
+                            if app.mode == Mode::Webcam {
+                                app.webcam_player.stop_streaming();
+                                app.mode = Mode::Video;
+                                app.status_message = "Video mode - [w] Webcam".to_string();
+                            } else {
+                                app.video_player.stop();
+                                app.mode = Mode::Webcam;
+                                if let Err(e) = app.webcam_player.start_streaming() {
+                                    app.status_message = format!("Webcam error: {}", e);
+                                } else {
+                                    app.status_message = format!("📷 Webcam: {} - [n] Next device | [w] Video mode",
+                                        app.webcam_player.current_device_name());
+                                }
+                            }
+                        }
+                        KeyCode::Char('n') if app.mode == Mode::Webcam => {
+                            app.webcam_player.next_device();
+                            app.status_message = format!("📷 Webcam: {} - [n] Next device | [w] Video mode",
+                                app.webcam_player.current_device_name());
+                        }
+                        KeyCode::Char(' ') => {
+                            if app.mode == Mode::Webcam {
+                                let _ = app.webcam_player.toggle_streaming();
+                            } else {
+                                app.video_player.toggle_playback();
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if app.mode == Mode::Video {
+                                app.select();
+                            }
+                        }
                         KeyCode::Up | KeyCode::Char('k') => app.previous(),
                         KeyCode::Down | KeyCode::Char('j') => app.next(),
-                        KeyCode::Left | KeyCode::Char('h') => app.video_player.seek_backward(),
-                        KeyCode::Right | KeyCode::Char('l') => app.video_player.seek_forward(),
-                        KeyCode::Char('s') => app.video_player.stop(),
+                        KeyCode::Left | KeyCode::Char('h') => {
+                            if app.mode == Mode::Video {
+                                app.video_player.seek_backward();
+                            }
+                        }
+                        KeyCode::Right | KeyCode::Char('l') => {
+                            if app.mode == Mode::Video {
+                                app.video_player.seek_forward();
+                            }
+                        }
+                        KeyCode::Char('s') => {
+                            if app.mode == Mode::Video {
+                                app.video_player.stop();
+                            } else {
+                                app.webcam_player.stop_streaming();
+                            }
+                        }
                         KeyCode::Backspace => {
                             if let Some(parent) = app.current_dir.parent() {
                                 let path = parent.to_path_buf();
@@ -216,13 +277,32 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let title = if app.video_player.has_video() {
-        format!("🎬 RustVidya - {} fps, {}x{}",
-            app.video_player.fps as u32,
-            app.video_player.width,
-            app.video_player.height)
-    } else {
-        "🎬 RustVidya - Terminal Video Player".to_string()
+    let title = match app.mode {
+        Mode::Webcam => {
+            if app.webcam_player.is_streaming {
+                format!("📷 {} frames | {}x{} | avg={} | size={} | grid={}x{}",
+                    app.webcam_player.frame_count,
+                    app.webcam_player.width,
+                    app.webcam_player.height,
+                    app.webcam_player.last_frame_avg,
+                    app.webcam_player.last_frame_size,
+                    app.webcam_player.grid.dimensions().0,
+                    app.webcam_player.grid.dimensions().1)
+            } else {
+                format!("📷 RustVidya - Webcam: {} (paused)",
+                    app.webcam_player.current_device_name())
+            }
+        }
+        Mode::Video => {
+            if app.video_player.has_video() {
+                format!("🎬 RustVidya - {} fps, {}x{}",
+                    app.video_player.fps as u32,
+                    app.video_player.width,
+                    app.video_player.height)
+            } else {
+                "🎬 RustVidya - Terminal Video Player".to_string()
+            }
+        }
     };
 
     let header = Paragraph::new(title)
@@ -244,47 +324,96 @@ fn draw_main(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_video(f: &mut Frame, area: Rect, app: &mut App) {
+    let (title, border_color) = match app.mode {
+        Mode::Webcam => (" 📷 Webcam ", Color::Green),
+        Mode::Video => (" 🎬 Video ", Color::Yellow),
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title(" Video ")
-        .title_style(Style::default().fg(Color::Yellow));
+        .border_style(Style::default().fg(border_color))
+        .title(title)
+        .title_style(Style::default().fg(border_color));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if !app.video_player.has_video() {
-        let msg = Paragraph::new("No video loaded\n\nSelect a video file from the list →")
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(Alignment::Center);
-        f.render_widget(msg, inner);
-        return;
-    }
+    match app.mode {
+        Mode::Webcam => {
+            // Resize webcam grid if needed - must restart streaming to match new size
+            let (grid_w, grid_h) = app.webcam_player.grid.dimensions();
+            if grid_w != inner.width as usize || grid_h != inner.height as usize {
+                if let Ok(new_grid) = BrailleGrid::new(inner.width as usize, inner.height as usize) {
+                    let was_streaming = app.webcam_player.is_streaming;
+                    if was_streaming {
+                        app.webcam_player.stop_streaming();
+                    }
+                    app.webcam_player.grid = new_grid;
+                    if was_streaming {
+                        let _ = app.webcam_player.start_streaming();
+                    }
+                }
+            }
 
-    // Resize grid if needed
-    let (grid_w, grid_h) = app.video_player.grid.dimensions();
-    if grid_w != inner.width as usize || grid_h != inner.height as usize {
-        if let Ok(new_grid) = BrailleGrid::new(inner.width as usize, inner.height as usize) {
-            app.video_player.grid = new_grid;
-            app.video_player.render_current_frame();
+            if !app.webcam_player.is_streaming {
+                let msg = Paragraph::new("Webcam paused\n\nPress [Space] to start streaming")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                f.render_widget(msg, inner);
+                return;
+            }
+
+            // Render webcam braille grid
+            let (grid_w, grid_h) = app.webcam_player.grid.dimensions();
+            let mut lines: Vec<Line> = Vec::new();
+
+            for row in 0..grid_h {
+                let mut spans = Vec::new();
+                for col in 0..grid_w {
+                    let ch = app.webcam_player.grid.get_char(col, row);
+                    spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::Green)));
+                }
+                lines.push(Line::from(spans));
+            }
+
+            let para = Paragraph::new(lines);
+            f.render_widget(para, inner);
+        }
+        Mode::Video => {
+            if !app.video_player.has_video() {
+                let msg = Paragraph::new("No video loaded\n\nSelect a video file from the list →")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                f.render_widget(msg, inner);
+                return;
+            }
+
+            // Resize grid if needed
+            let (grid_w, grid_h) = app.video_player.grid.dimensions();
+            if grid_w != inner.width as usize || grid_h != inner.height as usize {
+                if let Ok(new_grid) = BrailleGrid::new(inner.width as usize, inner.height as usize) {
+                    app.video_player.grid = new_grid;
+                    app.video_player.render_current_frame();
+                }
+            }
+
+            // Render braille grid
+            let (grid_w, grid_h) = app.video_player.grid.dimensions();
+            let mut lines: Vec<Line> = Vec::new();
+
+            for row in 0..grid_h {
+                let mut spans = Vec::new();
+                for col in 0..grid_w {
+                    let ch = app.video_player.grid.get_char(col, row);
+                    spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::White)));
+                }
+                lines.push(Line::from(spans));
+            }
+
+            let para = Paragraph::new(lines);
+            f.render_widget(para, inner);
         }
     }
-
-    // Render braille grid
-    let (grid_w, grid_h) = app.video_player.grid.dimensions();
-    let mut lines: Vec<Line> = Vec::new();
-
-    for row in 0..grid_h {
-        let mut spans = Vec::new();
-        for col in 0..grid_w {
-            let ch = app.video_player.grid.get_char(col, row);
-            spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::White)));
-        }
-        lines.push(Line::from(spans));
-    }
-
-    let para = Paragraph::new(lines);
-    f.render_widget(para, inner);
 }
 
 fn draw_file_list(f: &mut Frame, area: Rect, app: &mut App) {
@@ -330,36 +459,69 @@ fn draw_file_list(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_progress(f: &mut Frame, area: Rect, app: &App) {
-    let progress = app.video_player.progress();
-    let duration = app.video_player.duration_str();
-    let state = if app.video_player.is_playing { "▶" } else { "⏸" };
+    match app.mode {
+        Mode::Webcam => {
+            let state = if app.webcam_player.is_streaming { "📷 LIVE" } else { "⏸ PAUSED" };
+            let device = app.webcam_player.current_device_name();
+            let label = format!("{} - {}", state, device);
 
-    let label = format!("{} {} {:>3.0}%", state, duration, progress * 100.0);
+            let gauge = Gauge::default()
+                .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Green)).title(" Webcam "))
+                .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
+                .ratio(if app.webcam_player.is_streaming { 1.0 } else { 0.0 })
+                .label(label);
 
-    let gauge = Gauge::default()
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)).title(" Progress "))
-        .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
-        .ratio(progress)
-        .label(label);
+            f.render_widget(gauge, area);
+        }
+        Mode::Video => {
+            let progress = app.video_player.progress();
+            let duration = app.video_player.duration_str();
+            let state = if app.video_player.is_playing { "▶" } else { "⏸" };
 
-    f.render_widget(gauge, area);
+            let label = format!("{} {} {:>3.0}%", state, duration, progress * 100.0);
+
+            let gauge = Gauge::default()
+                .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)).title(" Progress "))
+                .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
+                .ratio(progress)
+                .label(label);
+
+            f.render_widget(gauge, area);
+        }
+    }
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let controls = vec![
-        Span::styled(&app.status_message, Style::default().fg(Color::Green)),
-        Span::raw("  │  "),
-        Span::styled("Space", Style::default().fg(Color::Yellow)),
-        Span::raw(" Play/Pause "),
-        Span::styled("←→", Style::default().fg(Color::Yellow)),
-        Span::raw(" Seek "),
-        Span::styled("↑↓", Style::default().fg(Color::Yellow)),
-        Span::raw(" Nav "),
-        Span::styled("Enter", Style::default().fg(Color::Yellow)),
-        Span::raw(" Select "),
-        Span::styled("q", Style::default().fg(Color::Red)),
-        Span::raw(" Quit"),
-    ];
+    let controls = match app.mode {
+        Mode::Webcam => vec![
+            Span::styled(&app.status_message, Style::default().fg(Color::Green)),
+            Span::raw("  │  "),
+            Span::styled("w", Style::default().fg(Color::Yellow)),
+            Span::raw(" Video mode "),
+            Span::styled("n", Style::default().fg(Color::Yellow)),
+            Span::raw(" Next device "),
+            Span::styled("Space", Style::default().fg(Color::Yellow)),
+            Span::raw(" Toggle "),
+            Span::styled("q", Style::default().fg(Color::Red)),
+            Span::raw(" Quit"),
+        ],
+        Mode::Video => vec![
+            Span::styled(&app.status_message, Style::default().fg(Color::Green)),
+            Span::raw("  │  "),
+            Span::styled("w", Style::default().fg(Color::Yellow)),
+            Span::raw(" Webcam "),
+            Span::styled("Space", Style::default().fg(Color::Yellow)),
+            Span::raw(" Play/Pause "),
+            Span::styled("←→", Style::default().fg(Color::Yellow)),
+            Span::raw(" Seek "),
+            Span::styled("↑↓", Style::default().fg(Color::Yellow)),
+            Span::raw(" Nav "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(" Select "),
+            Span::styled("q", Style::default().fg(Color::Red)),
+            Span::raw(" Quit"),
+        ],
+    };
 
     let status = Paragraph::new(Line::from(controls))
         .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
