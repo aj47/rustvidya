@@ -1,5 +1,8 @@
 # RustVidya 🎬
 
+<img width="1192" height="1059" alt="image" src="https://github.com/user-attachments/assets/e144c897-3600-4ba1-8a76-b64d3c3cdc95" />
+
+
 A terminal-based video player and webcam viewer that renders video as braille characters using the [dotmax](https://crates.io/crates/dotmax) crate.
 
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
