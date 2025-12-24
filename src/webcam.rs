@@ -1,10 +1,100 @@
 use anyhow::{anyhow, Result};
 use dotmax::BrailleGrid;
+use dotmax::density::DensitySet;
+use dotmax::color::schemes::{ColorScheme, rainbow, heat_map, blue_purple, green_yellow, cyan_magenta, grayscale};
 use std::io::BufReader;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Instant;
+
+/// Available rendering modes for webcam display
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RenderMode {
+    Braille,      // Binary braille dots (original)
+    Ascii,        // 69-char ASCII density
+    Simple,       // 10-char simple density
+    Blocks,       // Unicode block characters
+}
+
+impl RenderMode {
+    pub fn next(&self) -> Self {
+        match self {
+            RenderMode::Braille => RenderMode::Ascii,
+            RenderMode::Ascii => RenderMode::Simple,
+            RenderMode::Simple => RenderMode::Blocks,
+            RenderMode::Blocks => RenderMode::Braille,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            RenderMode::Braille => "Braille",
+            RenderMode::Ascii => "ASCII",
+            RenderMode::Simple => "Simple",
+            RenderMode::Blocks => "Blocks",
+        }
+    }
+
+    pub fn density_set(&self) -> Option<DensitySet> {
+        match self {
+            RenderMode::Braille => None,
+            RenderMode::Ascii => Some(DensitySet::ascii()),
+            RenderMode::Simple => Some(DensitySet::simple()),
+            RenderMode::Blocks => Some(DensitySet::blocks()),
+        }
+    }
+}
+
+/// Available color schemes
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ColorMode {
+    None,
+    Rainbow,
+    HeatMap,
+    BluePurple,
+    GreenYellow,
+    CyanMagenta,
+    Grayscale,
+}
+
+impl ColorMode {
+    pub fn next(&self) -> Self {
+        match self {
+            ColorMode::None => ColorMode::Rainbow,
+            ColorMode::Rainbow => ColorMode::HeatMap,
+            ColorMode::HeatMap => ColorMode::BluePurple,
+            ColorMode::BluePurple => ColorMode::GreenYellow,
+            ColorMode::GreenYellow => ColorMode::CyanMagenta,
+            ColorMode::CyanMagenta => ColorMode::Grayscale,
+            ColorMode::Grayscale => ColorMode::None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            ColorMode::None => "None",
+            ColorMode::Rainbow => "Rainbow",
+            ColorMode::HeatMap => "HeatMap",
+            ColorMode::BluePurple => "BluePurple",
+            ColorMode::GreenYellow => "GreenYellow",
+            ColorMode::CyanMagenta => "CyanMagenta",
+            ColorMode::Grayscale => "Grayscale",
+        }
+    }
+
+    pub fn color_scheme(&self) -> Option<ColorScheme> {
+        match self {
+            ColorMode::None => None,
+            ColorMode::Rainbow => Some(rainbow()),
+            ColorMode::HeatMap => Some(heat_map()),
+            ColorMode::BluePurple => Some(blue_purple()),
+            ColorMode::GreenYellow => Some(green_yellow()),
+            ColorMode::CyanMagenta => Some(cyan_magenta()),
+            ColorMode::Grayscale => Some(grayscale()),
+        }
+    }
+}
 
 pub struct WebcamPlayer {
     pub grid: BrailleGrid,
@@ -17,15 +107,19 @@ pub struct WebcamPlayer {
     pub width: usize,
     pub height: usize,
     pub frame_count: usize,
-    pub last_frame_size: usize,  // For debugging
-    pub last_frame_avg: u8,      // For debugging
+    pub last_frame_size: usize,
+    pub last_frame_avg: u8,
+    pub render_mode: RenderMode,
+    pub color_mode: ColorMode,
+    pub brightness_threshold: u8,
+    last_intensities: Vec<f32>,  // Store intensities for color application
 }
 
 impl WebcamPlayer {
     pub fn new(grid_width: usize, grid_height: usize) -> Result<Self> {
         let grid = BrailleGrid::new(grid_width, grid_height)?;
         let available_devices = Self::list_devices()?;
-        
+
         Ok(Self {
             grid,
             is_streaming: false,
@@ -39,7 +133,27 @@ impl WebcamPlayer {
             frame_count: 0,
             last_frame_size: 0,
             last_frame_avg: 0,
+            render_mode: RenderMode::Braille,
+            color_mode: ColorMode::None,
+            brightness_threshold: 80,
+            last_intensities: Vec::new(),
         })
+    }
+
+    pub fn cycle_render_mode(&mut self) {
+        self.render_mode = self.render_mode.next();
+    }
+
+    pub fn cycle_color_mode(&mut self) {
+        self.color_mode = self.color_mode.next();
+    }
+
+    pub fn increase_threshold(&mut self) {
+        self.brightness_threshold = self.brightness_threshold.saturating_add(10);
+    }
+
+    pub fn decrease_threshold(&mut self) {
+        self.brightness_threshold = self.brightness_threshold.saturating_sub(10);
     }
 
     pub fn list_devices() -> Result<Vec<String>> {
@@ -192,8 +306,6 @@ impl WebcamPlayer {
 
     fn render_frame(&mut self, frame: &[u8]) {
         let (grid_w, grid_h) = self.grid.dimensions();
-        let dot_w = grid_w * 2;
-        let dot_h = grid_h * 4;
 
         // Debug: skip if frame size mismatch
         let expected_size = self.width * self.height;
@@ -201,18 +313,84 @@ impl WebcamPlayer {
             return;
         }
 
+        // Clear characters and colors first
         self.grid.clear();
+        self.grid.clear_characters();
+        self.grid.clear_colors();
 
-        for y in 0..dot_h {
-            for x in 0..dot_w {
-                // Scale to source frame
-                let src_x = (x * self.width) / dot_w;
-                let src_y = (y * self.height) / dot_h;
-                let idx = src_y * self.width + src_x;
+        match self.render_mode {
+            RenderMode::Braille => {
+                // Original binary braille dot rendering
+                let dot_w = grid_w * 2;
+                let dot_h = grid_h * 4;
 
-                if idx < frame.len() && frame[idx] > 80 {
-                    let _ = self.grid.set_dot(x, y);
+                for y in 0..dot_h {
+                    for x in 0..dot_w {
+                        let src_x = (x * self.width) / dot_w;
+                        let src_y = (y * self.height) / dot_h;
+                        let idx = src_y * self.width + src_x;
+
+                        if idx < frame.len() && frame[idx] > self.brightness_threshold {
+                            let _ = self.grid.set_dot(x, y);
+                        }
+                    }
                 }
+            }
+            _ => {
+                // Density-based rendering (ASCII, Simple, Blocks)
+                // Create intensity buffer for the grid (one value per cell)
+                self.last_intensities.clear();
+                self.last_intensities.reserve(grid_w * grid_h);
+
+                for cell_y in 0..grid_h {
+                    for cell_x in 0..grid_w {
+                        // Sample the center of the cell from the source frame
+                        let src_x = (cell_x * self.width) / grid_w;
+                        let src_y = (cell_y * self.height) / grid_h;
+                        let idx = src_y * self.width + src_x;
+
+                        let intensity = if idx < frame.len() {
+                            frame[idx] as f32 / 255.0
+                        } else {
+                            0.0
+                        };
+                        self.last_intensities.push(intensity);
+                    }
+                }
+
+                // Apply density set
+                if let Some(density_set) = self.render_mode.density_set() {
+                    let _ = self.grid.render_density(&self.last_intensities, &density_set);
+                }
+            }
+        }
+
+        // Apply color scheme if selected
+        if self.color_mode != ColorMode::None {
+            // Create intensity buffer for color application
+            let intensities: Vec<f32> = if self.last_intensities.len() == grid_w * grid_h {
+                self.last_intensities.clone()
+            } else {
+                // Create new intensity buffer for braille mode
+                let mut intensities = Vec::with_capacity(grid_w * grid_h);
+                for cell_y in 0..grid_h {
+                    for cell_x in 0..grid_w {
+                        let src_x = (cell_x * self.width) / grid_w;
+                        let src_y = (cell_y * self.height) / grid_h;
+                        let idx = src_y * self.width + src_x;
+                        let intensity = if idx < frame.len() {
+                            frame[idx] as f32 / 255.0
+                        } else {
+                            0.0
+                        };
+                        intensities.push(intensity);
+                    }
+                }
+                intensities
+            };
+
+            if let Some(color_scheme) = self.color_mode.color_scheme() {
+                let _ = self.grid.apply_color_scheme(&intensities, &color_scheme);
             }
         }
     }

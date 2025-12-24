@@ -209,8 +209,34 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                         }
                         KeyCode::Char('n') if app.mode == Mode::Webcam => {
                             app.webcam_player.next_device();
-                            app.status_message = format!("📷 Webcam: {} - [n] Next device | [w] Video mode",
-                                app.webcam_player.current_device_name());
+                            app.status_message = format!("📷 {} | Mode: {} | Color: {}",
+                                app.webcam_player.current_device_name(),
+                                app.webcam_player.render_mode.name(),
+                                app.webcam_player.color_mode.name());
+                        }
+                        KeyCode::Char('m') if app.mode == Mode::Webcam => {
+                            // Cycle render mode
+                            app.webcam_player.cycle_render_mode();
+                            app.status_message = format!("Render mode: {} | [m] Next mode | [c] Color",
+                                app.webcam_player.render_mode.name());
+                        }
+                        KeyCode::Char('c') if app.mode == Mode::Webcam => {
+                            // Cycle color mode
+                            app.webcam_player.cycle_color_mode();
+                            app.status_message = format!("Color: {} | [c] Next color | [m] Mode",
+                                app.webcam_player.color_mode.name());
+                        }
+                        KeyCode::Char('+') | KeyCode::Char('=') if app.mode == Mode::Webcam => {
+                            // Increase brightness threshold
+                            app.webcam_player.increase_threshold();
+                            app.status_message = format!("Threshold: {} | [+/-] Adjust",
+                                app.webcam_player.brightness_threshold);
+                        }
+                        KeyCode::Char('-') if app.mode == Mode::Webcam => {
+                            // Decrease brightness threshold
+                            app.webcam_player.decrease_threshold();
+                            app.status_message = format!("Threshold: {} | [+/-] Adjust",
+                                app.webcam_player.brightness_threshold);
                         }
                         KeyCode::Char(' ') => {
                             if app.mode == Mode::Webcam {
@@ -280,14 +306,12 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let title = match app.mode {
         Mode::Webcam => {
             if app.webcam_player.is_streaming {
-                format!("📷 {} frames | {}x{} | avg={} | size={} | grid={}x{}",
-                    app.webcam_player.frame_count,
-                    app.webcam_player.width,
-                    app.webcam_player.height,
-                    app.webcam_player.last_frame_avg,
-                    app.webcam_player.last_frame_size,
-                    app.webcam_player.grid.dimensions().0,
-                    app.webcam_player.grid.dimensions().1)
+                format!("📷 {} | Mode: {} | Color: {} | Thresh: {} | {}fps",
+                    app.webcam_player.current_device_name(),
+                    app.webcam_player.render_mode.name(),
+                    app.webcam_player.color_mode.name(),
+                    app.webcam_player.brightness_threshold,
+                    app.webcam_player.frame_count)
             } else {
                 format!("📷 RustVidya - Webcam: {} (paused)",
                     app.webcam_player.current_device_name())
@@ -363,7 +387,7 @@ fn draw_video(f: &mut Frame, area: Rect, app: &mut App) {
                 return;
             }
 
-            // Render webcam braille grid
+            // Render webcam grid (braille or density characters with optional colors)
             let (grid_w, grid_h) = app.webcam_player.grid.dimensions();
             let mut lines: Vec<Line> = Vec::new();
 
@@ -371,7 +395,13 @@ fn draw_video(f: &mut Frame, area: Rect, app: &mut App) {
                 let mut spans = Vec::new();
                 for col in 0..grid_w {
                     let ch = app.webcam_player.grid.get_char(col, row);
-                    spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::Green)));
+                    let color = if let Some(dotmax_color) = app.webcam_player.grid.get_color(col, row) {
+                        // Convert dotmax::Color to ratatui::Color
+                        Color::Rgb(dotmax_color.r, dotmax_color.g, dotmax_color.b)
+                    } else {
+                        Color::White  // Default to white for no color
+                    };
+                    spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
                 }
                 lines.push(Line::from(spans));
             }
@@ -497,9 +527,15 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(&app.status_message, Style::default().fg(Color::Green)),
             Span::raw("  │  "),
             Span::styled("w", Style::default().fg(Color::Yellow)),
-            Span::raw(" Video mode "),
+            Span::raw(" Video "),
+            Span::styled("m", Style::default().fg(Color::Cyan)),
+            Span::raw(" Mode "),
+            Span::styled("c", Style::default().fg(Color::Magenta)),
+            Span::raw(" Color "),
+            Span::styled("+/-", Style::default().fg(Color::Yellow)),
+            Span::raw(" Thresh "),
             Span::styled("n", Style::default().fg(Color::Yellow)),
-            Span::raw(" Next device "),
+            Span::raw(" Dev "),
             Span::styled("Space", Style::default().fg(Color::Yellow)),
             Span::raw(" Toggle "),
             Span::styled("q", Style::default().fg(Color::Red)),
