@@ -8,6 +8,35 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Instant;
 
+/// Available dithering algorithms
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DitheringMode {
+    None,           // Simple threshold (no dithering)
+    FloydSteinberg, // Floyd-Steinberg error diffusion (smooth gradients)
+    Atkinson,       // Atkinson dithering (high contrast, Mac-style)
+    Bayer,          // Bayer ordered dithering (patterned)
+}
+
+impl DitheringMode {
+    pub fn next(&self) -> Self {
+        match self {
+            DitheringMode::None => DitheringMode::FloydSteinberg,
+            DitheringMode::FloydSteinberg => DitheringMode::Atkinson,
+            DitheringMode::Atkinson => DitheringMode::Bayer,
+            DitheringMode::Bayer => DitheringMode::None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            DitheringMode::None => "None",
+            DitheringMode::FloydSteinberg => "Floyd-Steinberg",
+            DitheringMode::Atkinson => "Atkinson",
+            DitheringMode::Bayer => "Bayer",
+        }
+    }
+}
+
 /// Available rendering modes for webcam display
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RenderMode {
@@ -111,8 +140,10 @@ pub struct WebcamPlayer {
     pub last_frame_avg: u8,
     pub render_mode: RenderMode,
     pub color_mode: ColorMode,
+    pub dithering_mode: DitheringMode,
     pub brightness_threshold: u8,
     last_intensities: Vec<f32>,  // Store intensities for color application
+    last_frame: Vec<u8>,         // Store last frame for re-rendering on settings change
 }
 
 impl WebcamPlayer {
@@ -135,25 +166,44 @@ impl WebcamPlayer {
             last_frame_avg: 0,
             render_mode: RenderMode::Braille,
             color_mode: ColorMode::None,
+            dithering_mode: DitheringMode::None,
             brightness_threshold: 80,
             last_intensities: Vec::new(),
+            last_frame: Vec::new(),
         })
     }
 
     pub fn cycle_render_mode(&mut self) {
         self.render_mode = self.render_mode.next();
+        self.rerender_last_frame();
     }
 
     pub fn cycle_color_mode(&mut self) {
         self.color_mode = self.color_mode.next();
+        self.rerender_last_frame();
+    }
+
+    pub fn cycle_dithering_mode(&mut self) {
+        self.dithering_mode = self.dithering_mode.next();
+        self.rerender_last_frame();
     }
 
     pub fn increase_threshold(&mut self) {
         self.brightness_threshold = self.brightness_threshold.saturating_add(10);
+        self.rerender_last_frame();
     }
 
     pub fn decrease_threshold(&mut self) {
         self.brightness_threshold = self.brightness_threshold.saturating_sub(10);
+        self.rerender_last_frame();
+    }
+
+    /// Re-render the last frame with current settings (called when mode/color/threshold changes)
+    fn rerender_last_frame(&mut self) {
+        if !self.last_frame.is_empty() {
+            let frame = self.last_frame.clone();
+            self.render_frame(&frame);
+        }
     }
 
     pub fn list_devices() -> Result<Vec<String>> {
@@ -297,6 +347,8 @@ impl WebcamPlayer {
                 self.last_frame_avg = if frame.is_empty() { 0 } else {
                     (frame.iter().map(|&b| b as u64).sum::<u64>() / frame.len() as u64) as u8
                 };
+                // Store frame for re-rendering on settings change
+                self.last_frame = frame.clone();
                 self.render_frame(&frame);
                 self.last_frame_time = Instant::now();
                 self.frame_count += 1;
@@ -318,11 +370,28 @@ impl WebcamPlayer {
         self.grid.clear_characters();
         self.grid.clear_colors();
 
+        // Apply dithering if enabled (for Braille mode)
+        let dithered_frame: Vec<u8>;
+        let working_frame = if self.render_mode == RenderMode::Braille && self.dithering_mode != DitheringMode::None {
+            dithered_frame = match self.dithering_mode {
+                DitheringMode::FloydSteinberg => apply_floyd_steinberg(frame, self.width, self.height, self.brightness_threshold),
+                DitheringMode::Atkinson => apply_atkinson(frame, self.width, self.height, self.brightness_threshold),
+                DitheringMode::Bayer => apply_bayer(frame, self.width, self.height, self.brightness_threshold),
+                DitheringMode::None => unreachable!(),
+            };
+            &dithered_frame
+        } else {
+            frame
+        };
+
         match self.render_mode {
             RenderMode::Braille => {
-                // Original binary braille dot rendering
+                // Binary braille dot rendering (with optional dithering applied above)
                 let dot_w = grid_w * 2;
                 let dot_h = grid_h * 4;
+
+                // When dithering is applied, pixels are already 0 or 255
+                let threshold = if self.dithering_mode != DitheringMode::None { 127 } else { self.brightness_threshold };
 
                 for y in 0..dot_h {
                     for x in 0..dot_w {
@@ -330,7 +399,7 @@ impl WebcamPlayer {
                         let src_y = (y * self.height) / dot_h;
                         let idx = src_y * self.width + src_x;
 
-                        if idx < frame.len() && frame[idx] > self.brightness_threshold {
+                        if idx < working_frame.len() && working_frame[idx] > threshold {
                             let _ = self.grid.set_dot(x, y);
                         }
                     }
@@ -409,3 +478,106 @@ impl Drop for WebcamPlayer {
     }
 }
 
+// Bayer 4x4 dithering matrix (normalized to 0-15)
+const BAYER_MATRIX_4X4: [[u8; 4]; 4] = [
+    [ 0,  8,  2, 10],
+    [12,  4, 14,  6],
+    [ 3, 11,  1,  9],
+    [15,  7, 13,  5],
+];
+
+/// Apply Floyd-Steinberg dithering to a grayscale buffer
+/// Returns a new buffer with dithered values (0 or 255)
+fn apply_floyd_steinberg(input: &[u8], width: usize, height: usize, threshold: u8) -> Vec<u8> {
+    let mut buffer: Vec<i16> = input.iter().map(|&v| v as i16).collect();
+    let mut output = vec![0u8; input.len()];
+    let threshold = threshold as i16;
+
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            let old_pixel = buffer[idx].clamp(0, 255);
+            let new_pixel: i16 = if old_pixel > threshold { 255 } else { 0 };
+            output[idx] = new_pixel as u8;
+            let error = old_pixel - new_pixel;
+
+            // Distribute error to neighbors (Floyd-Steinberg pattern)
+            // [   *   7/16 ]
+            // [ 3/16 5/16 1/16 ]
+            if x + 1 < width {
+                buffer[idx + 1] += error * 7 / 16;
+            }
+            if y + 1 < height {
+                if x > 0 {
+                    buffer[(y + 1) * width + (x - 1)] += error * 3 / 16;
+                }
+                buffer[(y + 1) * width + x] += error * 5 / 16;
+                if x + 1 < width {
+                    buffer[(y + 1) * width + (x + 1)] += error / 16;
+                }
+            }
+        }
+    }
+    output
+}
+
+/// Apply Atkinson dithering to a grayscale buffer
+/// Returns a new buffer with dithered values (0 or 255)
+/// Atkinson only diffuses 6/8 of the error, giving higher contrast
+fn apply_atkinson(input: &[u8], width: usize, height: usize, threshold: u8) -> Vec<u8> {
+    let mut buffer: Vec<i16> = input.iter().map(|&v| v as i16).collect();
+    let mut output = vec![0u8; input.len()];
+    let threshold = threshold as i16;
+
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            let old_pixel = buffer[idx].clamp(0, 255);
+            let new_pixel: i16 = if old_pixel > threshold { 255 } else { 0 };
+            output[idx] = new_pixel as u8;
+            let error = old_pixel - new_pixel;
+            let diffused = error / 8; // Atkinson only diffuses 6/8 of error
+
+            // Atkinson pattern:
+            // [   *  1  1 ]
+            // [ 1  1  1   ]
+            // [    1      ]
+            if x + 1 < width {
+                buffer[idx + 1] += diffused;
+            }
+            if x + 2 < width {
+                buffer[idx + 2] += diffused;
+            }
+            if y + 1 < height {
+                if x > 0 {
+                    buffer[(y + 1) * width + (x - 1)] += diffused;
+                }
+                buffer[(y + 1) * width + x] += diffused;
+                if x + 1 < width {
+                    buffer[(y + 1) * width + (x + 1)] += diffused;
+                }
+            }
+            if y + 2 < height {
+                buffer[(y + 2) * width + x] += diffused;
+            }
+        }
+    }
+    output
+}
+
+/// Apply Bayer ordered dithering to a grayscale buffer
+/// Returns a new buffer with dithered values (0 or 255)
+fn apply_bayer(input: &[u8], width: usize, height: usize, _threshold: u8) -> Vec<u8> {
+    let mut output = vec![0u8; input.len()];
+
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            let pixel = input[idx];
+            // Get threshold from Bayer matrix (scaled to 0-255)
+            let bayer_threshold = BAYER_MATRIX_4X4[y % 4][x % 4] * 16;
+            output[idx] = if pixel > bayer_threshold { 255 } else { 0 };
+        }
+    }
+    output
+}

@@ -226,6 +226,12 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                             app.status_message = format!("Color: {} | [c] Next color | [m] Mode",
                                 app.webcam_player.color_mode.name());
                         }
+                        KeyCode::Char('d') if app.mode == Mode::Webcam => {
+                            // Cycle dithering mode
+                            app.webcam_player.cycle_dithering_mode();
+                            app.status_message = format!("Dithering: {} | [d] Next dither | [m] Mode",
+                                app.webcam_player.dithering_mode.name());
+                        }
                         KeyCode::Char('+') | KeyCode::Char('=') if app.mode == Mode::Webcam => {
                             // Increase brightness threshold
                             app.webcam_player.increase_threshold();
@@ -306,9 +312,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let title = match app.mode {
         Mode::Webcam => {
             if app.webcam_player.is_streaming {
-                format!("📷 {} | Mode: {} | Color: {} | Thresh: {} | {}fps",
+                format!("📷 {} | Mode: {} | Dither: {} | Color: {} | Thresh: {} | {}fps",
                     app.webcam_player.current_device_name(),
                     app.webcam_player.render_mode.name(),
+                    app.webcam_player.dithering_mode.name(),
                     app.webcam_player.color_mode.name(),
                     app.webcam_player.brightness_threshold,
                     app.webcam_player.frame_count)
