@@ -43,6 +43,7 @@ struct App {
     mode: Mode,
     status_message: String,
     scroll_offset: usize,
+    fullscreen: bool,
 }
 
 impl App {
@@ -57,6 +58,7 @@ impl App {
             mode: Mode::Video,
             status_message: String::from("Welcome to RustVidya 🎬 - [w] Webcam | Select a video file"),
             scroll_offset: 0,
+            fullscreen: false,
         };
         app.load_directory(&current_dir);
         Ok(app)
@@ -275,6 +277,15 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
                                 app.webcam_player.stop_streaming();
                             }
                         }
+                        KeyCode::Char('f') => {
+                            // Toggle fullscreen mode
+                            app.fullscreen = !app.fullscreen;
+                            app.status_message = if app.fullscreen {
+                                "Fullscreen mode - [f] Exit fullscreen".to_string()
+                            } else {
+                                "Normal mode - [f] Fullscreen".to_string()
+                            };
+                        }
                         KeyCode::Backspace => {
                             if let Some(parent) = app.current_dir.parent() {
                                 let path = parent.to_path_buf();
@@ -292,20 +303,26 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
 }
 
 fn draw_ui(f: &mut Frame, app: &mut App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),  // Header
-            Constraint::Min(10),    // Main content (video + file list)
-            Constraint::Length(3),  // Progress bar
-            Constraint::Length(3),  // Status bar
-        ])
-        .split(f.area());
+    if app.fullscreen {
+        // Fullscreen mode - only show video/webcam
+        draw_video(f, f.area(), app);
+    } else {
+        // Normal mode - show all UI elements
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),  // Header
+                Constraint::Min(10),    // Main content (video + file list)
+                Constraint::Length(3),  // Progress bar
+                Constraint::Length(3),  // Status bar
+            ])
+            .split(f.area());
 
-    draw_header(f, chunks[0], app);
-    draw_main(f, chunks[1], app);
-    draw_progress(f, chunks[2], app);
-    draw_status(f, chunks[3], app);
+        draw_header(f, chunks[0], app);
+        draw_main(f, chunks[1], app);
+        draw_progress(f, chunks[2], app);
+        draw_status(f, chunks[3], app);
+    }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -533,6 +550,8 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::Webcam => vec![
             Span::styled(&app.status_message, Style::default().fg(Color::Green)),
             Span::raw("  │  "),
+            Span::styled("f", Style::default().fg(Color::Cyan)),
+            Span::raw(" Fullscreen "),
             Span::styled("w", Style::default().fg(Color::Yellow)),
             Span::raw(" Video "),
             Span::styled("m", Style::default().fg(Color::Cyan)),
@@ -551,6 +570,8 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::Video => vec![
             Span::styled(&app.status_message, Style::default().fg(Color::Green)),
             Span::raw("  │  "),
+            Span::styled("f", Style::default().fg(Color::Cyan)),
+            Span::raw(" Fullscreen "),
             Span::styled("w", Style::default().fg(Color::Yellow)),
             Span::raw(" Webcam "),
             Span::styled("Space", Style::default().fg(Color::Yellow)),
