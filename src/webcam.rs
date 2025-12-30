@@ -365,7 +365,7 @@ impl WebcamPlayer {
             return;
         }
 
-        // Clear characters and colors first
+        // Clear grid, characters, and colors first
         self.grid.clear();
         self.grid.clear_characters();
         self.grid.clear_colors();
@@ -434,31 +434,34 @@ impl WebcamPlayer {
             }
         }
 
-        // Apply color scheme if selected
+        // Apply color scheme if selected (must be done after rendering characters/dots)
         if self.color_mode != ColorMode::None {
-            // Create intensity buffer for color application
-            let intensities: Vec<f32> = if self.last_intensities.len() == grid_w * grid_h {
-                self.last_intensities.clone()
-            } else {
-                // Create new intensity buffer for braille mode
-                let mut intensities = Vec::with_capacity(grid_w * grid_h);
-                for cell_y in 0..grid_h {
-                    for cell_x in 0..grid_w {
-                        let src_x = (cell_x * self.width) / grid_w;
-                        let src_y = (cell_y * self.height) / grid_h;
-                        let idx = src_y * self.width + src_x;
-                        let intensity = if idx < frame.len() {
-                            frame[idx] as f32 / 255.0
-                        } else {
-                            0.0
-                        };
-                        intensities.push(intensity);
-                    }
-                }
-                intensities
-            };
-
             if let Some(color_scheme) = self.color_mode.color_scheme() {
+                // Create intensity buffer for color application
+                let intensities: Vec<f32> = if !self.last_intensities.is_empty() && self.last_intensities.len() == grid_w * grid_h {
+                    // Reuse intensities from density rendering
+                    self.last_intensities.clone()
+                } else {
+                    // Create new intensity buffer for braille mode
+                    // Always use original frame for color intensity calculation
+                    let mut intensities = Vec::with_capacity(grid_w * grid_h);
+                    for cell_y in 0..grid_h {
+                        for cell_x in 0..grid_w {
+                            let src_x = (cell_x * self.width) / grid_w;
+                            let src_y = (cell_y * self.height) / grid_h;
+                            let idx = src_y * self.width + src_x;
+                            let intensity = if idx < frame.len() {
+                                frame[idx] as f32 / 255.0
+                            } else {
+                                0.0
+                            };
+                            intensities.push(intensity);
+                        }
+                    }
+                    intensities
+                };
+
+                // Apply the color scheme to the grid
                 let _ = self.grid.apply_color_scheme(&intensities, &color_scheme);
             }
         }
